@@ -8,8 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cosmos/cosmos-sdk/simapp"
+	"google.golang.org/grpc"
+
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/module/testutil"
 	querytypes "github.com/cosmos/cosmos-sdk/types/query"
 	distributiontypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
 	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
@@ -17,7 +19,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/grpc"
 )
 
 func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.ClientConn) {
@@ -430,7 +431,7 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 			validatorUnbondingsGauge.With(prometheus.Labels{
 				"address":     unbonding.ValidatorAddress,
 				"moniker":     validator.Validator.Description.Moniker,
-				"denom":       Denom, 
+				"denom":       Denom,
 				"unbonded_by": unbonding.DelegatorAddress,
 			}).Set(sum / DenomCoefficient)
 		}
@@ -480,7 +481,7 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 			validatorRedelegationsGauge.With(prometheus.Labels{
 				"address":        redelegation.Redelegation.ValidatorSrcAddress,
 				"moniker":        validator.Validator.Description.Moniker,
-				"denom":          Denom, 
+				"denom":          Denom,
 				"redelegated_by": redelegation.Redelegation.DelegatorAddress,
 				"redelegated_to": redelegation.Redelegation.ValidatorDstAddress,
 			}).Set(sum / DenomCoefficient)
@@ -496,10 +497,10 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 			Msg("Started querying validator signing info")
 		queryStart := time.Now()
 
-		encCfg := simapp.MakeTestEncodingConfig()
+		encCfg := testutil.MakeTestEncodingConfig()
 		interfaceRegistry := encCfg.InterfaceRegistry
 
-		err := validator.Validator.UnpackInterfaces(interfaceRegistry) 
+		err := validator.Validator.UnpackInterfaces(interfaceRegistry)
 		if err != nil {
 			sublogger.Error().
 				Str("address", address).
@@ -633,7 +634,6 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 			Str("address", address).
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying validator params")
-
 
 		var active float64
 

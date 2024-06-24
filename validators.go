@@ -10,18 +10,19 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cosmos/cosmos-sdk/simapp"
+	"google.golang.org/grpc"
+
+	"github.com/cosmos/cosmos-sdk/types/module/testutil"
 	querytypes "github.com/cosmos/cosmos-sdk/types/query"
 	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/grpc"
 )
 
 func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.ClientConn) {
-	encCfg := simapp.MakeTestEncodingConfig()
+	encCfg := testutil.MakeTestEncodingConfig()
 	interfaceRegistry := encCfg.InterfaceRegistry
 
 	requestStart := time.Now()
@@ -243,7 +244,6 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 				"moniker": moniker,
 			}).Set(float64(validator.Status))
 
-
 			var jailed float64
 
 			if validator.Jailed {
@@ -288,7 +288,7 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 						"denom":   Denom,
 					}).Set(minSelfDelegationFloatVal)
 
-					err = validator.UnpackInterfaces(interfaceRegistry) 
+					err = validator.UnpackInterfaces(interfaceRegistry)
 					if err != nil {
 						sublogger.Error().
 							Str("address", validator.OperatorAddress).
