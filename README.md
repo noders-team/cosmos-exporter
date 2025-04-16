@@ -1,3 +1,6 @@
+<<<<<<< HEAD
+# cosmos-exporter
+=======
 # cosmos-exporter
 
 ![Latest release](https://img.shields.io/github/v/release/solarlabsteam/cosmos-exporter)
@@ -169,3 +172,4 @@ In theory, it should work on a Cosmos-based blockchains with cosmos-sdk >= 0.40.
 ## How can I contribute?
 
 Bug reports and feature requests are always welcome! If you want to contribute, feel free to open issues or PRs.
+>>>>>>> dev
