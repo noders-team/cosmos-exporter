@@ -10,7 +10,7 @@ cosmos-exporter is a Prometheus scraper that fetches the data from a full node o
 
 ## What can I use it for?
 
-You can run a full node, run cosmos-exporter on the same host, set up Prometheus to scrape the data from it (see below for instructions), then set up Grafana to visualize the data coming from the exporter and probably add some alerting. Here are some examples of Grafana dashboards we created for ourselves:
+You can run a full node, run cosmos-exporter on same host, set up Prometheus to scrape the data from it (see below for instructions), then set up Grafana to visualize the data coming from the exporter and probably add some alerting. Here are some examples of Grafana dashboards we created for ourselves:
 
 ![Validator dashboard](https://raw.githubusercontent.com/solarlabsteam/cosmos-exporter/master/images/dashboard_validator.png)
 ![Validators dashboard](https://raw.githubusercontent.com/solarlabsteam/cosmos-exporter/master/images/dashboard_validators.png)
