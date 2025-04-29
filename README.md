@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-# cosmos-exporter
-=======
 # cosmos-exporter
 
 ![Latest release](https://img.shields.io/github/v/release/solarlabsteam/cosmos-exporter)
