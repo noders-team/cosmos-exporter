@@ -140,6 +140,9 @@ You can pass the artuments to the executable file to configure it. Here is the p
 - `--log-devel` - logger level. Defaults to `info`. You can set it to `debug` to make it more verbose.
 - `--limit` - pagination limit for gRPC requests. Defaults to 1000.
 - `--json` - output logs as JSON. Useful if you don't read it on servers but instead use logging aggregation solutions such as ELK stack.
+- `--refresh-interval` - how often metrics may be re-collected from the node. Scrapes in between are served from an in-memory cache, so the node sees at most one collection per endpoint per interval no matter how many Prometheus instances scrape the exporter. Defaults to `30s`.
+- `--grpc-timeout` - timeout for collecting metrics from the node. Defaults to `15s`.
+- `--tls` - use TLS for the gRPC connection (e.g. for public endpoints on port 443). Defaults to plaintext.
 
 
 You can also specify custom Bech32 prefixes for wallets, validators, consensus nodes, and their pubkeys by using the following params:

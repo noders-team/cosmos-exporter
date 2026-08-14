@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"sort"
 	"strconv"
 	"sync"
@@ -13,80 +10,19 @@ import (
 
 	"google.golang.org/grpc"
 
-	sdk "github.com/cosmos/cosmos-sdk/types"
 	querytypes "github.com/cosmos/cosmos-sdk/types/query"
 	distributiontypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
 	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func getConsensusAddress(validator stakingtypes.Validator) (string, error) {
-	// Создаем HTTP клиент
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	// Формируем URL для запроса валидатора через Tendermint RPC
-	url := fmt.Sprintf("%s/validators", TendermintRPC)
-
-	// Выполняем HTTP запрос
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Читаем тело ответа
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	// Парсим JSON ответ
-	var result struct {
-		Result struct {
-			Validators []struct {
-				Address string `json:"address"`
-				PubKey  struct {
-					Type  string `json:"type"`
-					Value string `json:"value"`
-				} `json:"pub_key"`
-			} `json:"validators"`
-		} `json:"result"`
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", err
-	}
-
-	// Ищем валидатора по операторскому адресу
-	for _, v := range result.Result.Validators {
-		if v.PubKey.Type == "cometbft/PubKeyBn254" {
-			return v.Address, nil
-		}
-	}
-
-	return "", fmt.Errorf("validator not found")
-}
-
-func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.ClientConn) {
+func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, address string) (*prometheus.Registry, error) {
 	requestStart := time.Now()
 	sublogger := log.With().
 		Str("request-id", uuid.New().String()).
 		Logger()
-
-	address := r.URL.Query().Get("address")
-	myAddress, err := sdk.ValAddressFromBech32(address)
-	if err != nil {
-		sublogger.Error().
-			Str("address", address).
-			Err(err).
-			Msg("Could not parse validator address")
-		return
-	}
 
 	validatorDelegationsGauge := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -227,18 +163,15 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 	stakingClient := stakingtypes.NewQueryClient(grpcConn)
 	validatorResp, err := stakingClient.Validator(
-		context.Background(),
-		&stakingtypes.QueryValidatorRequest{ValidatorAddr: myAddress.String()},
+		ctx,
+		&stakingtypes.QueryValidatorRequest{ValidatorAddr: address},
 	)
 	if err != nil {
-		sublogger.Error().
-			Str("address", address).
-			Err(err).
-			Msg("Could not get validator")
-		return
+		return nil, fmt.Errorf("could not get validator %s: %w", address, err)
 	}
 
 	validator := validatorResp.Validator
+	moniker := sanitizeUTF8(validator.Description.Moniker)
 
 	sublogger.Debug().
 		Str("address", address).
@@ -253,7 +186,7 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 	} else {
 		validatorTokensGauge.With(prometheus.Labels{
 			"address": validator.OperatorAddress,
-			"moniker": validator.Description.Moniker,
+			"moniker": moniker,
 			"denom":   Denom,
 		}).Set(value / DenomCoefficient)
 	}
@@ -266,7 +199,7 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 	} else {
 		validatorDelegatorSharesGauge.With(prometheus.Labels{
 			"address": validator.OperatorAddress,
-			"moniker": validator.Description.Moniker,
+			"moniker": moniker,
 			"denom":   Denom,
 		}).Set(value / DenomCoefficient)
 	}
@@ -279,31 +212,27 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 	} else {
 		validatorCommissionRateGauge.With(prometheus.Labels{
 			"address": validator.OperatorAddress,
-			"moniker": validator.Description.Moniker,
+			"moniker": moniker,
 		}).Set(rate)
 	}
 
 	validatorStatusGauge.With(prometheus.Labels{
 		"address": validator.OperatorAddress,
-		"moniker": validator.Description.Moniker,
+		"moniker": moniker,
 	}).Set(float64(validator.Status))
 
 	var jailed float64
 	if validator.Jailed {
 		jailed = 1
-	} else {
-		jailed = 0
 	}
 	validatorJailedGauge.With(prometheus.Labels{
 		"address": validator.OperatorAddress,
-		"moniker": validator.Description.Moniker,
+		"moniker": moniker,
 	}).Set(jailed)
 
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator delegations")
@@ -311,16 +240,16 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		stakingRes, err := stakingClient.ValidatorDelegations(
-			context.Background(),
+			ctx,
 			&stakingtypes.QueryValidatorDelegationsRequest{
-				ValidatorAddr: myAddress.String(),
+				ValidatorAddr: address,
 				Pagination: &querytypes.PageRequest{
 					Limit: Limit,
 				},
 			},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get validator delegations")
@@ -334,24 +263,22 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 		for _, delegation := range stakingRes.DelegationResponses {
 			if value, err := strconv.ParseFloat(delegation.Balance.Amount.String(), 64); err != nil {
-				log.Error().
+				sublogger.Error().
 					Err(err).
 					Str("address", address).
 					Msg("Could not convert delegation entry")
 			} else {
 				validatorDelegationsGauge.With(prometheus.Labels{
-					"moniker":      validator.Description.Moniker,
+					"moniker":      moniker,
 					"address":      delegation.Delegation.ValidatorAddress,
 					"denom":        Denom,
 					"delegated_by": delegation.Delegation.DelegatorAddress,
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator commission")
@@ -359,11 +286,11 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 		distributionClient := distributiontypes.NewQueryClient(grpcConn)
 		distributionRes, err := distributionClient.ValidatorCommission(
-			context.Background(),
-			&distributiontypes.QueryValidatorCommissionRequest{ValidatorAddress: myAddress.String()},
+			ctx,
+			&distributiontypes.QueryValidatorCommissionRequest{ValidatorAddress: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get validator commission")
@@ -377,23 +304,21 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 		for _, commission := range distributionRes.Commission.Commission {
 			if value, err := strconv.ParseFloat(commission.Amount.String(), 64); err != nil {
-				log.Error().
+				sublogger.Error().
 					Err(err).
 					Str("address", address).
 					Msg("Could not parse validator commission")
 			} else {
 				validatorCommissionGauge.With(prometheus.Labels{
 					"address": address,
-					"moniker": validator.Description.Moniker,
+					"moniker": moniker,
 					"denom":   Denom,
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator rewards")
@@ -401,11 +326,11 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 		distributionClient := distributiontypes.NewQueryClient(grpcConn)
 		distributionRes, err := distributionClient.ValidatorOutstandingRewards(
-			context.Background(),
-			&distributiontypes.QueryValidatorOutstandingRewardsRequest{ValidatorAddress: myAddress.String()},
+			ctx,
+			&distributiontypes.QueryValidatorOutstandingRewardsRequest{ValidatorAddress: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get validator rewards")
@@ -426,16 +351,14 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 			} else {
 				validatorRewardsGauge.With(prometheus.Labels{
 					"address": address,
-					"moniker": validator.Description.Moniker,
+					"moniker": moniker,
 					"denom":   Denom,
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator unbonding delegations")
@@ -443,11 +366,11 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		stakingRes, err := stakingClient.ValidatorUnbondingDelegations(
-			context.Background(),
-			&stakingtypes.QueryValidatorUnbondingDelegationsRequest{ValidatorAddr: myAddress.String()},
+			ctx,
+			&stakingtypes.QueryValidatorUnbondingDelegationsRequest{ValidatorAddr: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get validator unbonding delegations")
@@ -460,10 +383,10 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 			Msg("Finished querying validator unbonding delegations")
 
 		for _, unbonding := range stakingRes.UnbondingResponses {
-			var sum float64 = 0
+			var sum float64
 			for _, entry := range unbonding.Entries {
 				if value, err := strconv.ParseFloat(entry.Balance.String(), 64); err != nil {
-					log.Error().
+					sublogger.Error().
 						Err(err).
 						Str("address", address).
 						Msg("Could not convert unbonding delegation entry")
@@ -474,16 +397,14 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 			validatorUnbondingsGauge.With(prometheus.Labels{
 				"address":     unbonding.ValidatorAddress,
-				"moniker":     validator.Description.Moniker,
+				"moniker":     moniker,
 				"denom":       Denom,
 				"unbonded_by": unbonding.DelegatorAddress,
 			}).Set(sum / DenomCoefficient)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator redelegations")
@@ -491,11 +412,11 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		stakingRes, err := stakingClient.Redelegations(
-			context.Background(),
-			&stakingtypes.QueryRedelegationsRequest{SrcValidatorAddr: myAddress.String()},
+			ctx,
+			&stakingtypes.QueryRedelegationsRequest{SrcValidatorAddr: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get redelegations")
@@ -508,10 +429,10 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 			Msg("Finished querying validator redelegations")
 
 		for _, redelegation := range stakingRes.RedelegationResponses {
-			var sum float64 = 0
+			var sum float64
 			for _, entry := range redelegation.Entries {
 				if value, err := strconv.ParseFloat(entry.Balance.String(), 64); err != nil {
-					log.Error().
+					sublogger.Error().
 						Err(err).
 						Str("address", address).
 						Msg("Could not convert redelegation entry")
@@ -522,53 +443,55 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 			validatorRedelegationsGauge.With(prometheus.Labels{
 				"address":        redelegation.Redelegation.ValidatorSrcAddress,
-				"moniker":        validator.Description.Moniker,
+				"moniker":        moniker,
 				"denom":          Denom,
 				"redelegated_by": redelegation.Redelegation.DelegatorAddress,
 				"redelegated_to": redelegation.Redelegation.ValidatorDstAddress,
 			}).Set(sum / DenomCoefficient)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator signing info")
 
-		consAddr, err := getConsensusAddress(validator)
+		consAddr, err := consAddressFromValidator(validator, ConsensusNodePrefix)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", validator.OperatorAddress).
 				Err(err).
-				Msg("Could not get validator consensus address, skipping consensus metrics")
-		} else {
-			slashingClient := slashingtypes.NewQueryClient(grpcConn)
-			slashingRes, err := slashingClient.SigningInfo(
-				context.Background(),
-				&slashingtypes.QuerySigningInfoRequest{ConsAddress: consAddr},
-			)
-			if err != nil {
-				sublogger.Debug().
-					Str("address", validator.OperatorAddress).
-					Msg("Could not get signing info for validator")
-			} else if validator.Status == stakingtypes.Bonded {
-				validatorMissedBlocksGauge.With(prometheus.Labels{
-					"address": validator.OperatorAddress,
-					"moniker": validator.Description.Moniker,
-				}).Set(float64(slashingRes.ValSigningInfo.MissedBlocksCounter))
-			} else {
-				sublogger.Trace().
-					Str("address", validator.OperatorAddress).
-					Msg("Validator is not active, not returning missed blocks amount.")
-			}
+				Msg("Could not derive validator consensus address, skipping missed blocks")
+			return
 		}
-	}()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+		slashingClient := slashingtypes.NewQueryClient(grpcConn)
+		slashingRes, err := slashingClient.SigningInfo(
+			ctx,
+			&slashingtypes.QuerySigningInfoRequest{ConsAddress: consAddr},
+		)
+		if err != nil {
+			sublogger.Warn().
+				Str("address", validator.OperatorAddress).
+				Str("cons-address", consAddr).
+				Err(err).
+				Msg("Could not get signing info for validator")
+			return
+		}
+
+		if validator.Status == stakingtypes.Bonded {
+			validatorMissedBlocksGauge.With(prometheus.Labels{
+				"address": validator.OperatorAddress,
+				"moniker": moniker,
+			}).Set(float64(slashingRes.ValSigningInfo.MissedBlocksCounter))
+		} else {
+			sublogger.Trace().
+				Str("address", validator.OperatorAddress).
+				Msg("Validator is not active, not returning missed blocks amount.")
+		}
+	})
+
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator rank and active status")
@@ -576,7 +499,7 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		stakingRes, err := stakingClient.Validators(
-			context.Background(),
+			ctx,
 			&stakingtypes.QueryValidatorsRequest{
 				Pagination: &querytypes.PageRequest{
 					Limit: Limit,
@@ -584,7 +507,7 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 			},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get validators list")
@@ -594,17 +517,7 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 		validators := stakingRes.Validators
 
 		sort.Slice(validators, func(i, j int) bool {
-			firstShares, firstErr := strconv.ParseFloat(validators[i].DelegatorShares.String(), 64)
-			secondShares, secondErr := strconv.ParseFloat(validators[j].DelegatorShares.String(), 64)
-
-			if firstErr != nil || secondErr != nil {
-				sublogger.Error().
-					Err(err).
-					Msg("Error converting delegator shares for sorting")
-				return true
-			}
-
-			return firstShares > secondShares
+			return validators[i].DelegatorShares.GT(validators[j].DelegatorShares)
 		})
 
 		var validatorRank int
@@ -623,16 +536,16 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 		}
 
 		validatorRankGauge.With(prometheus.Labels{
-			"moniker": validator.Description.Moniker,
+			"moniker": moniker,
 			"address": validator.OperatorAddress,
 		}).Set(float64(validatorRank))
 
 		paramsRes, err := stakingClient.Params(
-			context.Background(),
+			ctx,
 			&stakingtypes.QueryParamsRequest{},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get staking params")
@@ -642,28 +555,25 @@ func ValidatorHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cli
 		var active float64
 		if validatorRank <= int(paramsRes.Params.MaxValidators) {
 			active = 1
-		} else {
-			active = 0
 		}
 
 		validatorIsActiveGauge.With(prometheus.Labels{
 			"address": validator.OperatorAddress,
-			"moniker": validator.Description.Moniker,
+			"moniker": moniker,
 		}).Set(active)
 
 		sublogger.Debug().
 			Str("address", address).
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying validator rank and active status")
-	}()
+	})
 
 	wg.Wait()
 
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
 	sublogger.Info().
-		Str("method", "GET").
 		Str("endpoint", "/metrics/validator?address="+address).
-		Float64("request-time", time.Since(requestStart).Seconds()).
-		Msg("Request processed")
+		Float64("collect-time", time.Since(requestStart).Seconds()).
+		Msg("Metrics collected")
+
+	return registry, nil
 }

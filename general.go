@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
-	"net/http"
+	"fmt"
+	"math/big"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -15,10 +17,9 @@ import (
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func GeneralHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.ClientConn) {
+func collectGeneralMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*prometheus.Registry, error) {
 	requestStart := time.Now()
 
 	sublogger := log.With().
@@ -85,46 +86,50 @@ func GeneralHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Clien
 	registry.MustRegister(generalAnnualProvisions)
 
 	var wg sync.WaitGroup
+	var successfulQueries atomic.Int64
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying staking pool")
 		queryStart := time.Now()
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		response, err := stakingClient.Pool(
-			context.Background(),
+			ctx,
 			&stakingtypes.QueryPoolRequest{},
 		)
 		if err != nil {
-			sublogger.Error().Err(err).Msg("Could not get staking pool")
+			sublogger.Warn().Err(err).Msg("Could not get staking pool")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying staking pool")
 
-		generalBondedTokensGauge.Set(float64(response.Pool.BondedTokens.Int64()))
-		generalNotBondedTokensGauge.Set(float64(response.Pool.NotBondedTokens.Int64()))
-	}()
+		// Int64() паникует при переполнении (18-decimal деномы), поэтому
+		// конвертируем через big.Float. Значения намеренно остаются в
+		// микроединицах — дашборды завязаны на это (см. GOTCHAS).
+		bondedTokens, _ := new(big.Float).SetInt(response.Pool.BondedTokens.BigInt()).Float64()
+		notBondedTokens, _ := new(big.Float).SetInt(response.Pool.NotBondedTokens.BigInt()).Float64()
+		generalBondedTokensGauge.Set(bondedTokens)
+		generalNotBondedTokensGauge.Set(notBondedTokens)
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying distribution community pool")
 		queryStart := time.Now()
 
 		distributionClient := distributiontypes.NewQueryClient(grpcConn)
 		response, err := distributionClient.CommunityPool(
-			context.Background(),
+			ctx,
 			&distributiontypes.QueryCommunityPoolRequest{},
 		)
 		if err != nil {
-			sublogger.Error().Err(err).Msg("Could not get distribution community pool")
+			sublogger.Warn().Err(err).Msg("Could not get distribution community pool")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
@@ -141,23 +146,22 @@ func GeneralHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Clien
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying bank total supply")
 		queryStart := time.Now()
 
 		bankClient := banktypes.NewQueryClient(grpcConn)
 		response, err := bankClient.TotalSupply(
-			context.Background(),
+			ctx,
 			&banktypes.QueryTotalSupplyRequest{},
 		)
 		if err != nil {
-			sublogger.Error().Err(err).Msg("Could not get bank total supply")
+			sublogger.Warn().Err(err).Msg("Could not get bank total supply")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
@@ -174,23 +178,24 @@ func GeneralHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Clien
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying inflation")
 		queryStart := time.Now()
 
 		mintClient := minttypes.NewQueryClient(grpcConn)
 		response, err := mintClient.Inflation(
-			context.Background(),
+			ctx,
 			&minttypes.QueryInflationRequest{},
 		)
 		if err != nil {
-			sublogger.Error().Err(err).Msg("Could not get inflation")
+			// Кастомные mint-модули (Sei) не отдают стандартную инфляцию —
+			// это ожидаемая деградация, а не сбой экспортера.
+			sublogger.Warn().Err(err).Msg("Could not get inflation (custom mint module?)")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
@@ -203,23 +208,22 @@ func GeneralHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Clien
 		} else {
 			generalInflationGauge.Set(value)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying annual provisions")
 		queryStart := time.Now()
 
 		mintClient := minttypes.NewQueryClient(grpcConn)
 		response, err := mintClient.AnnualProvisions(
-			context.Background(),
+			ctx,
 			&minttypes.QueryAnnualProvisionsRequest{},
 		)
 		if err != nil {
-			sublogger.Error().Err(err).Msg("Could not get annual provisions")
+			sublogger.Warn().Err(err).Msg("Could not get annual provisions (custom mint module?)")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
@@ -234,15 +238,18 @@ func GeneralHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Clien
 				"denom": Denom,
 			}).Set(value / DenomCoefficient)
 		}
-	}()
+	})
 
 	wg.Wait()
 
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
+	if successfulQueries.Load() == 0 {
+		return nil, fmt.Errorf("all general metric queries failed, node unreachable?")
+	}
+
 	sublogger.Info().
-		Str("method", "GET").
 		Str("endpoint", "/metrics/general").
-		Float64("request-time", time.Since(requestStart).Seconds()).
-		Msg("Request processed")
+		Float64("collect-time", time.Since(requestStart).Seconds()).
+		Msg("Metrics collected")
+
+	return registry, nil
 }
