@@ -261,10 +261,15 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				return res.DelegationResponses, res.Pagination, nil
 			})
 		if err != nil {
+			message := "Could not get validator delegations"
+			if isScanLimitError(err) {
+				message += ". This chain limits how much of the delegation store a query may scan; " +
+					"pass --skip-validator-delegations to drop this metric, or lower --limit"
+			}
 			sublogger.Warn().
 				Str("address", address).
 				Err(err).
-				Msg("Could not get validator delegations")
+				Msg(message)
 			return
 		}
 

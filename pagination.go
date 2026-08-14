@@ -54,6 +54,10 @@ func paginateAll[T any](ctx context.Context, pageLimit uint64, maxItems int, fet
 	return paginateFrom(ctx, firstPageKey, pageLimit, maxItems, fetch)
 }
 
+// minPageLimit is the smallest page size worth trying: below this the number
+// of round trips outweighs any chance of the node accepting the page.
+const minPageLimit = 10
+
 func paginateFrom[T any](ctx context.Context, startKey []byte, pageLimit uint64, maxItems int, fetch pageFetcher[T]) ([]T, error) {
 	if pageLimit == 0 {
 		pageLimit = 100
@@ -80,6 +84,19 @@ func paginateFrom[T any](ctx context.Context, startKey []byte, pageLimit uint64,
 			Key:   nextKey,
 			Limit: limit,
 		})
+		// A node that caps store scans cannot fill a large page when matching
+		// entries are sparse. Shrink the page and retry; the smaller size
+		// sticks for the rest of the walk.
+		if err != nil && isScanLimitError(err) && pageLimit > minPageLimit {
+			pageLimit /= 10
+			if pageLimit < minPageLimit {
+				pageLimit = minPageLimit
+			}
+			log.Debug().
+				Uint64("page-limit", pageLimit).
+				Msg("Node could not fill the page within its scan limit, retrying with a smaller page")
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
