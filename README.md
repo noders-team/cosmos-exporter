@@ -138,7 +138,9 @@ You can pass the artuments to the executable file to configure it. Here is the p
 - `--node` - the gRPC node URL. Defaults to `localhost:9090`
 - `--tendermint-rpc` - Tendermint RPC URL to query node stats (specifically `chain-id`). Defaults to `http://localhost:26657`
 - `--log-devel` - logger level. Defaults to `info`. You can set it to `debug` to make it more verbose.
-- `--limit` - pagination limit for gRPC requests. Defaults to 1000.
+- `--limit` - page size for paginated gRPC requests. Results are fetched page by page until the node reports no more pages. Defaults to 1000.
+- `--max-delegations` - maximum number of per-delegator entries to fetch for a validator (`0` for no limit). Each entry becomes its own Prometheus time series, so this caps both scrape cost and cardinality. Defaults to 100000.
+- `--skip-validator-delegations` - do not collect `cosmos_validator_delegations` at all. Useful on chains with very large delegator sets (e.g. Sei), where the per-delegator series are expensive for both the node and Prometheus.
 - `--json` - output logs as JSON. Useful if you don't read it on servers but instead use logging aggregation solutions such as ELK stack.
 - `--refresh-interval` - how often metrics may be re-collected from the node. Scrapes in between are served from an in-memory cache, so the node sees at most one collection per endpoint per interval no matter how many Prometheus instances scrape the exporter. Defaults to `30s`.
 - `--grpc-timeout` - timeout for collecting metrics from the node. Defaults to `15s`.

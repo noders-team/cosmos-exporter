@@ -233,21 +233,33 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 	var wg sync.WaitGroup
 
 	goSafe(&wg, func() {
+		if SkipValidatorDelegations {
+			sublogger.Debug().
+				Str("address", address).
+				Msg("Skipping per-delegator metrics (--skip-validator-delegations)")
+			return
+		}
+
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator delegations")
 		queryStart := time.Now()
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
-		stakingRes, err := stakingClient.ValidatorDelegations(
-			ctx,
-			&stakingtypes.QueryValidatorDelegationsRequest{
-				ValidatorAddr: address,
-				Pagination: &querytypes.PageRequest{
-					Limit: Limit,
-				},
-			},
-		)
+		delegations, err := paginateAll(ctx, Limit, MaxDelegations,
+			func(ctx context.Context, page *querytypes.PageRequest) ([]stakingtypes.DelegationResponse, *querytypes.PageResponse, error) {
+				res, err := stakingClient.ValidatorDelegations(
+					ctx,
+					&stakingtypes.QueryValidatorDelegationsRequest{
+						ValidatorAddr: address,
+						Pagination:    page,
+					},
+				)
+				if err != nil {
+					return nil, nil, err
+				}
+				return res.DelegationResponses, res.Pagination, nil
+			})
 		if err != nil {
 			sublogger.Warn().
 				Str("address", address).
@@ -258,10 +270,11 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 
 		sublogger.Debug().
 			Str("address", address).
+			Int("delegations", len(delegations)).
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying validator delegations")
 
-		for _, delegation := range stakingRes.DelegationResponses {
+		for _, delegation := range delegations {
 			if value, err := strconv.ParseFloat(delegation.Balance.Amount.String(), 64); err != nil {
 				sublogger.Error().
 					Err(err).
@@ -498,14 +511,14 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 		queryStart := time.Now()
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
-		stakingRes, err := stakingClient.Validators(
-			ctx,
-			&stakingtypes.QueryValidatorsRequest{
-				Pagination: &querytypes.PageRequest{
-					Limit: Limit,
-				},
-			},
-		)
+		validators, err := paginateAll(ctx, Limit, 0,
+			func(ctx context.Context, page *querytypes.PageRequest) ([]stakingtypes.Validator, *querytypes.PageResponse, error) {
+				res, err := stakingClient.Validators(ctx, &stakingtypes.QueryValidatorsRequest{Pagination: page})
+				if err != nil {
+					return nil, nil, err
+				}
+				return res.Validators, res.Pagination, nil
+			})
 		if err != nil {
 			sublogger.Warn().
 				Str("address", address).
@@ -513,8 +526,6 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				Msg("Could not get validators list")
 			return
 		}
-
-		validators := stakingRes.Validators
 
 		sort.Slice(validators, func(i, j int) bool {
 			return validators[i].DelegatorShares.GT(validators[j].DelegatorShares)

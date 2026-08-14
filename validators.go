@@ -131,14 +131,14 @@ func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*
 		queryStart := time.Now()
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
-		validatorsResponse, err := stakingClient.Validators(
-			ctx,
-			&stakingtypes.QueryValidatorsRequest{
-				Pagination: &querytypes.PageRequest{
-					Limit: Limit,
-				},
-			},
-		)
+		fetched, err := paginateAll(ctx, Limit, 0,
+			func(ctx context.Context, page *querytypes.PageRequest) ([]stakingtypes.Validator, *querytypes.PageResponse, error) {
+				res, err := stakingClient.Validators(ctx, &stakingtypes.QueryValidatorsRequest{Pagination: page})
+				if err != nil {
+					return nil, nil, err
+				}
+				return res.Validators, res.Pagination, nil
+			})
 		if err != nil {
 			validatorsErr = fmt.Errorf("could not get validators: %w", err)
 			return
@@ -147,7 +147,7 @@ func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying validators")
-		validators = validatorsResponse.Validators
+		validators = fetched
 
 		sort.Slice(validators, func(i, j int) bool {
 			return validators[i].DelegatorShares.GT(validators[j].DelegatorShares)
@@ -159,14 +159,14 @@ func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*
 		queryStart := time.Now()
 
 		slashingClient := slashingtypes.NewQueryClient(grpcConn)
-		signingInfosResponse, err := slashingClient.SigningInfos(
-			ctx,
-			&slashingtypes.QuerySigningInfosRequest{
-				Pagination: &querytypes.PageRequest{
-					Limit: Limit,
-				},
-			},
-		)
+		fetched, err := paginateAll(ctx, Limit, 0,
+			func(ctx context.Context, page *querytypes.PageRequest) ([]slashingtypes.ValidatorSigningInfo, *querytypes.PageResponse, error) {
+				res, err := slashingClient.SigningInfos(ctx, &slashingtypes.QuerySigningInfosRequest{Pagination: page})
+				if err != nil {
+					return nil, nil, err
+				}
+				return res.Info, res.Pagination, nil
+			})
 		if err != nil {
 			sublogger.Warn().
 				Err(err).
@@ -177,7 +177,7 @@ func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying validator signing infos")
-		signingInfos = signingInfosResponse.Info
+		signingInfos = fetched
 	})
 
 	goSafe(&wg, func() {

@@ -56,6 +56,9 @@ var (
 	RefreshInterval time.Duration
 	GRPCTimeout     time.Duration
 	TLSEnabled      bool
+
+	MaxDelegations           int
+	SkipValidatorDelegations bool
 )
 
 var log = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
@@ -445,6 +448,8 @@ func main() {
 	rootCmd.PersistentFlags().DurationVar(&RefreshInterval, "refresh-interval", 30*time.Second, "How often metrics may be re-collected from the node; scrapes in between are served from cache")
 	rootCmd.PersistentFlags().DurationVar(&GRPCTimeout, "grpc-timeout", 15*time.Second, "Timeout for collecting metrics from the node")
 	rootCmd.PersistentFlags().BoolVar(&TLSEnabled, "tls", false, "Use TLS for the gRPC connection (e.g. public endpoints on port 443)")
+	rootCmd.PersistentFlags().IntVar(&MaxDelegations, "max-delegations", 100000, "Maximum number of per-delegator entries to fetch for a validator (0 for no limit). Each entry becomes its own time series")
+	rootCmd.PersistentFlags().BoolVar(&SkipValidatorDelegations, "skip-validator-delegations", false, "Do not collect cosmos_validator_delegations. Useful on chains with very large delegator sets, where the per-delegator series are expensive for both the node and Prometheus")
 
 	rootCmd.PersistentFlags().StringVar(&Prefix, "bech-prefix", "persistence", "Bech32 global prefix")
 	rootCmd.PersistentFlags().StringVar(&AccountPrefix, "bech-account-prefix", "", "Bech32 account prefix")
