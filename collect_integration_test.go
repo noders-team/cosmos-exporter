@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"math/big"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -16,6 +19,8 @@ import (
 	sdkmath "cosmossdk.io/math"
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	"github.com/cosmos/cosmos-sdk/crypto/keys/ed25519"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	querytypes "github.com/cosmos/cosmos-sdk/types/query"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	distributiontypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
 	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
@@ -28,9 +33,11 @@ import (
 
 type fakeStakingServer struct {
 	stakingtypes.UnimplementedQueryServer
-	validators []stakingtypes.Validator
-	pool       stakingtypes.Pool
-	bondDenom  string
+	validators             []stakingtypes.Validator
+	pool                   stakingtypes.Pool
+	bondDenom              string
+	delegations            []stakingtypes.DelegationResponse
+	rejectOffsetPagination bool
 }
 
 func (s *fakeStakingServer) Validator(ctx context.Context, req *stakingtypes.QueryValidatorRequest) (*stakingtypes.QueryValidatorResponse, error) {
@@ -57,7 +64,39 @@ func (s *fakeStakingServer) Pool(ctx context.Context, req *stakingtypes.QueryPoo
 }
 
 func (s *fakeStakingServer) ValidatorDelegations(ctx context.Context, req *stakingtypes.QueryValidatorDelegationsRequest) (*stakingtypes.QueryValidatorDelegationsResponse, error) {
-	return &stakingtypes.QueryValidatorDelegationsResponse{}, nil
+	if s.delegations == nil {
+		return &stakingtypes.QueryValidatorDelegationsResponse{}, nil
+	}
+
+	page := req.Pagination
+	// Sei rejects offset-mode queries that would scan too much of the store.
+	if s.rejectOffsetPagination && len(page.GetKey()) == 0 {
+		return nil, status.Error(codes.InvalidArgument,
+			"scanned more than 10000 entries without filling the page; use key-based pagination instead")
+	}
+
+	start := 0
+	if key := page.GetKey(); len(key) > 0 && !bytes.Equal(key, firstPageKey) {
+		parsed, err := strconv.Atoi(string(key))
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "bad page key %q", key)
+		}
+		start = parsed
+	}
+
+	end := start + int(page.GetLimit())
+	if end > len(s.delegations) {
+		end = len(s.delegations)
+	}
+
+	response := &stakingtypes.QueryValidatorDelegationsResponse{
+		DelegationResponses: s.delegations[start:end],
+		Pagination:          &querytypes.PageResponse{},
+	}
+	if end < len(s.delegations) {
+		response.Pagination.NextKey = []byte(strconv.Itoa(end))
+	}
+	return response, nil
 }
 
 func (s *fakeStakingServer) ValidatorUnbondingDelegations(ctx context.Context, req *stakingtypes.QueryValidatorUnbondingDelegationsRequest) (*stakingtypes.QueryValidatorUnbondingDelegationsResponse, error) {
@@ -153,6 +192,8 @@ func setTestGlobals(t *testing.T) {
 	ConsensusNodePrefix = "seivalcons"
 	ConstLabels = prometheus.Labels{"chain_id": "sei-test-1"}
 	Limit = 1000
+	MaxDelegations = 0
+	SkipValidatorDelegations = false
 }
 
 func makeTestValidator(t *testing.T, operator, moniker string, missedBlocksKey *ed25519.PubKey) stakingtypes.Validator {
@@ -301,6 +342,81 @@ func TestCollectValidatorMissedBlocksUsesDerivedBech32ConsAddress(t *testing.T) 
 		if addr != consAddr {
 			t.Errorf("SigningInfo called with %q, want derived bech32 %q", addr, consAddr)
 		}
+	}
+}
+
+func TestCollectValidatorDelegationsOnChainRejectingOffsetPagination(t *testing.T) {
+	setTestGlobals(t)
+	Limit = 100
+	MaxDelegations = 0
+
+	key := ed25519.GenPrivKey().PubKey().(*ed25519.PubKey)
+	validator := makeTestValidator(t, "seivaloper1ccc", "noders", key)
+
+	const delegatorCount = 250
+	delegations := make([]stakingtypes.DelegationResponse, 0, delegatorCount)
+	for i := 0; i < delegatorCount; i++ {
+		delegations = append(delegations, stakingtypes.DelegationResponse{
+			Delegation: stakingtypes.Delegation{
+				DelegatorAddress: fmt.Sprintf("sei1delegator%d", i),
+				ValidatorAddress: "seivaloper1ccc",
+			},
+			Balance: sdk.NewCoin("usei", sdkmath.NewInt(2_000_000)),
+		})
+	}
+
+	staking := &fakeStakingServer{
+		validators:             []stakingtypes.Validator{validator},
+		delegations:            delegations,
+		rejectOffsetPagination: true,
+	}
+	conn := startFakeNode(t, staking, &fakeSlashingServer{})
+
+	registry, err := collectValidatorMetrics(context.Background(), conn, "seivaloper1ccc")
+	if err != nil {
+		t.Fatalf("collectValidatorMetrics failed: %v", err)
+	}
+
+	// Every delegator must be present despite the node refusing offset mode.
+	for _, i := range []int{0, 149, delegatorCount - 1} {
+		value, found := findGaugeValue(t, registry, "cosmos_validator_delegations", map[string]string{
+			"delegated_by": fmt.Sprintf("sei1delegator%d", i),
+		})
+		if !found {
+			t.Fatalf("delegation from sei1delegator%d missing — key-based pagination fallback did not collect all pages", i)
+		}
+		if value != 2 {
+			t.Errorf("delegation value = %v, want 2 (2_000_000 / 1_000_000)", value)
+		}
+	}
+}
+
+func TestCollectValidatorSkipsDelegationsWhenDisabled(t *testing.T) {
+	setTestGlobals(t)
+	SkipValidatorDelegations = true
+	t.Cleanup(func() { SkipValidatorDelegations = false })
+
+	key := ed25519.GenPrivKey().PubKey().(*ed25519.PubKey)
+	validator := makeTestValidator(t, "seivaloper1ddd", "noders", key)
+	staking := &fakeStakingServer{
+		validators: []stakingtypes.Validator{validator},
+		delegations: []stakingtypes.DelegationResponse{{
+			Delegation: stakingtypes.Delegation{DelegatorAddress: "sei1x", ValidatorAddress: "seivaloper1ddd"},
+			Balance:    sdk.NewCoin("usei", sdkmath.NewInt(1)),
+		}},
+	}
+	conn := startFakeNode(t, staking, &fakeSlashingServer{})
+
+	registry, err := collectValidatorMetrics(context.Background(), conn, "seivaloper1ddd")
+	if err != nil {
+		t.Fatalf("collectValidatorMetrics failed: %v", err)
+	}
+
+	if _, found := findGaugeValue(t, registry, "cosmos_validator_delegations", nil); found {
+		t.Error("per-delegator metrics present despite --skip-validator-delegations")
+	}
+	if _, found := findGaugeValue(t, registry, "cosmos_validator_tokens", nil); !found {
+		t.Error("other validator metrics must still be collected")
 	}
 }
 
