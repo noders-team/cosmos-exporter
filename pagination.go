@@ -5,11 +5,19 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	querytypes "github.com/cosmos/cosmos-sdk/types/query"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// delegationsUnsupported latches once the node refuses to serve
+// ValidatorDelegations because of its store-scan limit. Retrying that query
+// every refresh is actively harmful: each attempt makes the node scan tens of
+// thousands of store entries and starves concurrent queries, so the metric is
+// dropped for the lifetime of the process instead.
+var delegationsUnsupported atomic.Bool
 
 // firstPageKey starts a key-based scan from the very beginning of the store:
 // it sorts before any real entry, so the iterator behaves like an unkeyed one

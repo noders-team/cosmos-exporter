@@ -239,6 +239,12 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				Msg("Skipping per-delegator metrics (--skip-validator-delegations)")
 			return
 		}
+		if delegationsUnsupported.Load() {
+			sublogger.Debug().
+				Str("address", address).
+				Msg("Skipping per-delegator metrics (chain refused the query earlier)")
+			return
+		}
 
 		sublogger.Debug().
 			Str("address", address).
@@ -261,15 +267,24 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				return res.DelegationResponses, res.Pagination, nil
 			})
 		if err != nil {
-			message := "Could not get validator delegations"
 			if isScanLimitError(err) {
-				message += ". This chain limits how much of the delegation store a query may scan; " +
-					"pass --skip-validator-delegations to drop this metric, or lower --limit"
+				// Latch the metric off: every attempt forces the node to scan
+				// a large part of the delegation store, which starves the
+				// other queries in this same collection.
+				if delegationsUnsupported.CompareAndSwap(false, true) {
+					sublogger.Error().
+						Str("address", address).
+						Err(err).
+						Msg("This chain refuses to serve validator delegations (store-scan limit); " +
+							"cosmos_validator_delegations is now disabled for this process. " +
+							"Add --skip-validator-delegations to silence this and skip the query entirely")
+				}
+				return
 			}
 			sublogger.Warn().
 				Str("address", address).
 				Err(err).
-				Msg(message)
+				Msg("Could not get validator delegations")
 			return
 		}
 

@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -38,6 +39,8 @@ type fakeStakingServer struct {
 	bondDenom              string
 	delegations            []stakingtypes.DelegationResponse
 	rejectOffsetPagination bool
+	rejectAllPagination    bool
+	delegationCalls        atomic.Int64
 }
 
 func (s *fakeStakingServer) Validator(ctx context.Context, req *stakingtypes.QueryValidatorRequest) (*stakingtypes.QueryValidatorResponse, error) {
@@ -68,7 +71,15 @@ func (s *fakeStakingServer) ValidatorDelegations(ctx context.Context, req *staki
 		return &stakingtypes.QueryValidatorDelegationsResponse{}, nil
 	}
 
+	s.delegationCalls.Add(1)
+
 	page := req.Pagination
+	// A chain whose delegation store is too large to scan at all refuses
+	// every page size (Sei with a sparse validator).
+	if s.rejectAllPagination {
+		return nil, status.Error(codes.InvalidArgument,
+			"scanned more than 10000 entries without filling the page; use a more specific key prefix or reduce limit")
+	}
 	// Sei rejects offset-mode queries that would scan too much of the store.
 	if s.rejectOffsetPagination && len(page.GetKey()) == 0 {
 		return nil, status.Error(codes.InvalidArgument,
@@ -194,6 +205,7 @@ func setTestGlobals(t *testing.T) {
 	Limit = 1000
 	MaxDelegations = 0
 	SkipValidatorDelegations = false
+	delegationsUnsupported.Store(false)
 }
 
 func makeTestValidator(t *testing.T, operator, moniker string, missedBlocksKey *ed25519.PubKey) stakingtypes.Validator {
@@ -388,6 +400,50 @@ func TestCollectValidatorDelegationsOnChainRejectingOffsetPagination(t *testing.
 		if value != 2 {
 			t.Errorf("delegation value = %v, want 2 (2_000_000 / 1_000_000)", value)
 		}
+	}
+}
+
+func TestCollectValidatorStopsRetryingRefusedDelegations(t *testing.T) {
+	setTestGlobals(t)
+
+	key := ed25519.GenPrivKey().PubKey().(*ed25519.PubKey)
+	validator := makeTestValidator(t, "seivaloper1eee", "noders", key)
+	consAddr, err := consAddressFromValidator(validator, ConsensusNodePrefix)
+	if err != nil {
+		t.Fatalf("failed to derive consensus address: %v", err)
+	}
+
+	staking := &fakeStakingServer{
+		validators:          []stakingtypes.Validator{validator},
+		delegations:         []stakingtypes.DelegationResponse{{}},
+		rejectAllPagination: true,
+	}
+	slashing := &fakeSlashingServer{
+		signingInfos: []slashingtypes.ValidatorSigningInfo{{Address: consAddr, MissedBlocksCounter: 3}},
+	}
+	conn := startFakeNode(t, staking, slashing)
+
+	if _, err := collectValidatorMetrics(context.Background(), conn, "seivaloper1eee"); err != nil {
+		t.Fatalf("first collection failed: %v", err)
+	}
+	callsAfterFirst := staking.delegationCalls.Load()
+	if callsAfterFirst == 0 {
+		t.Fatal("expected the first collection to attempt the delegations query")
+	}
+
+	registry, err := collectValidatorMetrics(context.Background(), conn, "seivaloper1eee")
+	if err != nil {
+		t.Fatalf("second collection failed: %v", err)
+	}
+
+	if got := staking.delegationCalls.Load(); got != callsAfterFirst {
+		t.Errorf("delegations query was retried (%d -> %d calls); a refused query must not hammer the node every refresh",
+			callsAfterFirst, got)
+	}
+
+	// Everything else must keep working after the metric is latched off.
+	if missed, found := findGaugeValue(t, registry, "cosmos_validator_missed_blocks", nil); !found || missed != 3 {
+		t.Errorf("missed blocks = %v (found=%v), want 3", missed, found)
 	}
 }
 
