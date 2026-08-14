@@ -158,6 +158,12 @@ func Execute(cmd *cobra.Command, args []string) {
 		Str("--listen-address", ListenAddress).
 		Str("--node", NodeAddress).
 		Str("--log-level", LogLevel).
+		Str("--refresh-interval", RefreshInterval.String()).
+		Str("--grpc-timeout", GRPCTimeout.String()).
+		Bool("--tls", TLSEnabled).
+		Uint64("--limit", Limit).
+		Int("--max-delegations", MaxDelegations).
+		Bool("--skip-validator-delegations", SkipValidatorDelegations).
 		Msg("Started with following parameters")
 
 	config := sdk.GetConfig()
