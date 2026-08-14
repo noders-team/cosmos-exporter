@@ -2,38 +2,27 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math/big"
-	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
 
-	sdk "github.com/cosmos/cosmos-sdk/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	distributiontypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func WalletHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.ClientConn) {
+func collectWalletMetrics(ctx context.Context, grpcConn *grpc.ClientConn, address string) (*prometheus.Registry, error) {
 	requestStart := time.Now()
 
 	sublogger := log.With().
 		Str("request-id", uuid.New().String()).
 		Logger()
-
-	address := r.URL.Query().Get("address")
-	myAddress, err := sdk.AccAddressFromBech32(address)
-	if err != nil {
-		sublogger.Error().
-			Str("address", address).
-			Err(err).
-			Msg("Could not parse address")
-		return
-	}
 
 	walletBalanceGauge := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -88,6 +77,7 @@ func WalletHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 	registry.MustRegister(walletRewardsGauge)
 
 	var wg sync.WaitGroup
+	var successfulQueries atomic.Int64
 
 	wg.Add(1)
 	go func() {
@@ -99,16 +89,17 @@ func WalletHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		bankClient := banktypes.NewQueryClient(grpcConn)
 		bankRes, err := bankClient.AllBalances(
-			context.Background(),
-			&banktypes.QueryAllBalancesRequest{Address: myAddress.String()},
+			ctx,
+			&banktypes.QueryAllBalancesRequest{Address: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get balance")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Str("address", address).
@@ -134,16 +125,17 @@ func WalletHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		stakingRes, err := stakingClient.DelegatorDelegations(
-			context.Background(),
-			&stakingtypes.QueryDelegatorDelegationsRequest{DelegatorAddr: myAddress.String()},
+			ctx,
+			&stakingtypes.QueryDelegatorDelegationsRequest{DelegatorAddr: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get delegations")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Str("address", address).
@@ -170,16 +162,17 @@ func WalletHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		stakingRes, err := stakingClient.DelegatorUnbondingDelegations(
-			context.Background(),
-			&stakingtypes.QueryDelegatorUnbondingDelegationsRequest{DelegatorAddr: myAddress.String()},
+			ctx,
+			&stakingtypes.QueryDelegatorUnbondingDelegationsRequest{DelegatorAddr: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get unbonding delegations")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Str("address", address).
@@ -211,16 +204,17 @@ func WalletHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		stakingRes, err := stakingClient.Redelegations(
-			context.Background(),
-			&stakingtypes.QueryRedelegationsRequest{DelegatorAddr: myAddress.String()},
+			ctx,
+			&stakingtypes.QueryRedelegationsRequest{DelegatorAddr: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get redelegations")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Str("address", address).
@@ -253,16 +247,17 @@ func WalletHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		distributionClient := distributiontypes.NewQueryClient(grpcConn)
 		distributionRes, err := distributionClient.DelegationTotalRewards(
-			context.Background(),
-			&distributiontypes.QueryDelegationTotalRewardsRequest{DelegatorAddress: myAddress.String()},
+			ctx,
+			&distributiontypes.QueryDelegationTotalRewardsRequest{DelegatorAddress: address},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", address).
 				Err(err).
 				Msg("Could not get rewards")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Str("address", address).
@@ -283,11 +278,14 @@ func WalletHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 	wg.Wait()
 
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
+	if successfulQueries.Load() == 0 {
+		return nil, fmt.Errorf("all wallet metric queries failed for %s, node unreachable?", address)
+	}
+
 	sublogger.Info().
-		Str("method", "GET").
 		Str("endpoint", "/metrics/wallet?address="+address).
-		Float64("request-time", time.Since(requestStart).Seconds()).
-		Msg("Request processed")
+		Float64("collect-time", time.Since(requestStart).Seconds()).
+		Msg("Metrics collected")
+
+	return registry, nil
 }

@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	"net/http"
+	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -15,10 +16,9 @@ import (
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func ParamsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.ClientConn) {
+func collectParamsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*prometheus.Registry, error) {
 	requestStart := time.Now()
 
 	sublogger := log.With().
@@ -163,6 +163,7 @@ func ParamsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 	registry.MustRegister(paramsCommunityTaxGauge)
 
 	var wg sync.WaitGroup
+	var successfulQueries atomic.Int64
 
 	wg.Add(1)
 	go func() {
@@ -172,15 +173,16 @@ func ParamsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		paramsResponse, err := stakingClient.Params(
-			context.Background(),
+			ctx,
 			&stakingtypes.QueryParamsRequest{},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Err(err).
 				Msg("Could not get global staking params")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
@@ -198,15 +200,16 @@ func ParamsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		mintClient := minttypes.NewQueryClient(grpcConn)
 		paramsResponse, err := mintClient.Params(
-			context.Background(),
+			ctx,
 			&minttypes.QueryParamsRequest{},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Err(err).
-				Msg("Could not get global mint params")
+				Msg("Could not get global mint params (custom mint module?)")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
@@ -255,15 +258,16 @@ func ParamsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		slashingClient := slashingtypes.NewQueryClient(grpcConn)
 		paramsResponse, err := slashingClient.Params(
-			context.Background(),
+			ctx,
 			&slashingtypes.QueryParamsRequest{},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Err(err).
 				Msg("Could not get global slashing params")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
@@ -305,15 +309,16 @@ func ParamsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 		distributionClient := distributiontypes.NewQueryClient(grpcConn)
 		paramsResponse, err := distributionClient.Params(
-			context.Background(),
+			ctx,
 			&distributiontypes.QueryParamsRequest{},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Err(err).
 				Msg("Could not get global distribution params")
 			return
 		}
+		successfulQueries.Add(1)
 
 		sublogger.Debug().
 			Float64("request-time", time.Since(queryStart).Seconds()).
@@ -346,11 +351,14 @@ func ParamsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Client
 
 	wg.Wait()
 
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
+	if successfulQueries.Load() == 0 {
+		return nil, fmt.Errorf("all params metric queries failed, node unreachable?")
+	}
+
 	sublogger.Info().
-		Str("method", "GET").
 		Str("endpoint", "/metrics/params").
-		Float64("request-time", time.Since(requestStart).Seconds()).
-		Msg("Request processed")
+		Float64("collect-time", time.Since(requestStart).Seconds()).
+		Msg("Metrics collected")
+
+	return registry, nil
 }

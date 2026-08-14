@@ -3,9 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"math/big"
-	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -17,10 +18,9 @@ import (
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.ClientConn) {
+func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*prometheus.Registry, error) {
 	requestStart := time.Now()
 
 	sublogger := log.With().
@@ -120,6 +120,7 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 	registry.MustRegister(validatorsIsActiveGauge)
 
 	var validators []stakingtypes.Validator
+	var validatorsErr error
 	var signingInfos []slashingtypes.ValidatorSigningInfo
 	var validatorSetLength uint32
 
@@ -133,7 +134,7 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		validatorsResponse, err := stakingClient.Validators(
-			context.Background(),
+			ctx,
 			&stakingtypes.QueryValidatorsRequest{
 				Pagination: &querytypes.PageRequest{
 					Limit: Limit,
@@ -141,7 +142,7 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 			},
 		)
 		if err != nil {
-			sublogger.Error().Err(err).Msg("Could not get validators")
+			validatorsErr = fmt.Errorf("could not get validators: %w", err)
 			return
 		}
 
@@ -163,7 +164,7 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 
 		slashingClient := slashingtypes.NewQueryClient(grpcConn)
 		signingInfosResponse, err := slashingClient.SigningInfos(
-			context.Background(),
+			ctx,
 			&slashingtypes.QuerySigningInfosRequest{
 				Pagination: &querytypes.PageRequest{
 					Limit: Limit,
@@ -171,7 +172,7 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 			},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Err(err).
 				Msg("Could not get validators signing infos")
 			return
@@ -191,11 +192,11 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 
 		stakingClient := stakingtypes.NewQueryClient(grpcConn)
 		paramsResponse, err := stakingClient.Params(
-			context.Background(),
+			ctx,
 			&stakingtypes.QueryParamsRequest{},
 		)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Err(err).
 				Msg("Could not get staking params")
 			return
@@ -208,6 +209,10 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 	}()
 
 	wg.Wait()
+
+	if validatorsErr != nil {
+		return nil, validatorsErr
+	}
 
 	sublogger.Debug().
 		Int("signingLength", len(signingInfos)).
@@ -242,8 +247,16 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 			"moniker": moniker,
 		}).Set(jailed)
 
-		// Исправление для validator.DelegatorShares
-		value, _ = new(big.Float).SetInt(validator.DelegatorShares.BigInt()).Float64()
+		// LegacyDec.BigInt() возвращает внутреннее представление ×10^18,
+		// поэтому конвертируем через нормализованную строку.
+		value, err := strconv.ParseFloat(validator.DelegatorShares.String(), 64)
+		if err != nil {
+			sublogger.Error().
+				Str("address", validator.OperatorAddress).
+				Err(err).
+				Msg("Could not parse delegator shares")
+			value = 0
+		}
 		validatorsDelegatorSharesGauge.With(prometheus.Labels{
 			"address": validator.OperatorAddress,
 			"moniker": moniker,
@@ -258,19 +271,19 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 			"denom":   Denom,
 		}).Set(value / DenomCoefficient)
 
-		consAddr, err := validator.GetConsAddr()
+		consAddr, err := consAddressFromValidator(validator, ConsensusNodePrefix)
 		if err != nil {
-			sublogger.Error().
+			sublogger.Warn().
 				Str("address", validator.OperatorAddress).
 				Err(err).
-				Msg("Could not get validator consensus address")
+				Msg("Could not derive validator consensus address")
 			continue
 		}
 
 		var signingInfo slashingtypes.ValidatorSigningInfo
 		found := false
 		for _, signingInfoIterated := range signingInfos {
-			if bytes.Equal(consAddr, []byte(signingInfoIterated.Address)) {
+			if consAddr == signingInfoIterated.Address {
 				found = true
 				signingInfo = signingInfoIterated
 				break
@@ -311,13 +324,12 @@ func ValidatorsHandler(w http.ResponseWriter, r *http.Request, grpcConn *grpc.Cl
 		}
 	}
 
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
 	sublogger.Info().
-		Str("method", "GET").
 		Str("endpoint", "/metrics/validators").
-		Float64("request-time", time.Since(requestStart).Seconds()).
-		Msg("Request processed")
+		Float64("collect-time", time.Since(requestStart).Seconds()).
+		Msg("Metrics collected")
+
+	return registry, nil
 }
 
 func sanitizeUTF8(input string) string {

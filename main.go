@@ -13,8 +13,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/cosmos/cosmos-sdk/client/grpc/cmtservice"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
@@ -45,6 +47,9 @@ var (
 	ConstLabels      map[string]string
 	DenomCoefficient float64
 	DenomExponent    uint64
+
+	RefreshInterval time.Duration
+	GRPCTimeout     time.Duration
 )
 
 var log = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
@@ -152,7 +157,7 @@ func Execute(cmd *cobra.Command, args []string) {
 	config.SetBech32PrefixForConsensusNode(ConsensusNodePrefix, ConsensusNodePubkeyPrefix)
 	config.Seal()
 
-	grpcConn, err := grpc.Dial(
+	grpcConn, err := grpc.NewClient(
 		NodeAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
@@ -161,28 +166,56 @@ func Execute(cmd *cobra.Command, args []string) {
 	}
 	defer grpcConn.Close()
 
-	setChainID()
+	setChainID(grpcConn)
 	setDenom(grpcConn)
 
+	cache := NewMetricsCache(RefreshInterval, GRPCTimeout)
+
 	http.HandleFunc("/metrics/wallet", func(w http.ResponseWriter, r *http.Request) {
-		WalletHandler(w, r, grpcConn)
+		address := r.URL.Query().Get("address")
+		myAddress, err := sdk.AccAddressFromBech32(address)
+		if err != nil {
+			log.Error().Str("address", address).Err(err).Msg("Could not parse wallet address")
+			http.Error(w, fmt.Sprintf("invalid wallet address %q: %v", address, err), http.StatusBadRequest)
+			return
+		}
+		cache.Serve(w, r, "wallet?address="+myAddress.String(), func(ctx context.Context) ([]byte, error) {
+			registry, err := collectWalletMetrics(ctx, grpcConn, myAddress.String())
+			if err != nil {
+				return nil, err
+			}
+			return renderRegistry(registry)
+		})
 	})
 
 	http.HandleFunc("/metrics/validator", func(w http.ResponseWriter, r *http.Request) {
-		ValidatorHandler(w, r, grpcConn)
+		address := r.URL.Query().Get("address")
+		myAddress, err := sdk.ValAddressFromBech32(address)
+		if err != nil {
+			log.Error().Str("address", address).Err(err).Msg("Could not parse validator address")
+			http.Error(w, fmt.Sprintf("invalid validator address %q: %v", address, err), http.StatusBadRequest)
+			return
+		}
+		cache.Serve(w, r, "validator?address="+myAddress.String(), func(ctx context.Context) ([]byte, error) {
+			registry, err := collectValidatorMetrics(ctx, grpcConn, myAddress.String())
+			if err != nil {
+				return nil, err
+			}
+			return renderRegistry(registry)
+		})
 	})
 
-	http.HandleFunc("/metrics/validators", func(w http.ResponseWriter, r *http.Request) {
-		ValidatorsHandler(w, r, grpcConn)
-	})
+	http.HandleFunc("/metrics/validators", cachedMetricsHandler(cache, "validators", func(ctx context.Context) (*prometheus.Registry, error) {
+		return collectValidatorsMetrics(ctx, grpcConn)
+	}))
 
-	http.HandleFunc("/metrics/params", func(w http.ResponseWriter, r *http.Request) {
-		ParamsHandler(w, r, grpcConn)
-	})
+	http.HandleFunc("/metrics/params", cachedMetricsHandler(cache, "params", func(ctx context.Context) (*prometheus.Registry, error) {
+		return collectParamsMetrics(ctx, grpcConn)
+	}))
 
-	http.HandleFunc("/metrics/general", func(w http.ResponseWriter, r *http.Request) {
-		GeneralHandler(w, r, grpcConn)
-	})
+	http.HandleFunc("/metrics/general", cachedMetricsHandler(cache, "general", func(ctx context.Context) (*prometheus.Registry, error) {
+		return collectGeneralMetrics(ctx, grpcConn)
+	}))
 
 	log.Info().Str("address", ListenAddress).Msg("Listening")
 	err = http.ListenAndServe(ListenAddress, nil)
@@ -191,33 +224,69 @@ func Execute(cmd *cobra.Command, args []string) {
 	}
 }
 
-func setChainID() {
-	// Создаем HTTP клиент
+// cachedMetricsHandler wraps a parameterless collect function into an HTTP
+// handler that serves through the metrics cache.
+func cachedMetricsHandler(cache *MetricsCache, key string, collect func(ctx context.Context) (*prometheus.Registry, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cache.Serve(w, r, key, func(ctx context.Context) ([]byte, error) {
+			registry, err := collect(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return renderRegistry(registry)
+		})
+	}
+}
+
+// setChainID resolves the chain ID from Tendermint RPC, falling back to the
+// gRPC tendermint service, and finally to "unknown" so metrics stay labeled
+// even if the node was unreachable at startup.
+func setChainID(grpcConn *grpc.ClientConn) {
+	defer func() {
+		ConstLabels = prometheus.Labels{
+			"chain_id": ChainID,
+		}
+	}()
+
+	if chainID := chainIDFromTendermintRPC(); chainID != "" {
+		ChainID = chainID
+		log.Info().Str("chain_id", ChainID).Msg("Got chain ID from Tendermint RPC")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
+	defer cancel()
+
+	serviceClient := cmtservice.NewServiceClient(grpcConn)
+	nodeInfo, err := serviceClient.GetNodeInfo(ctx, &cmtservice.GetNodeInfoRequest{})
+	if err == nil && nodeInfo.DefaultNodeInfo != nil && nodeInfo.DefaultNodeInfo.Network != "" {
+		ChainID = nodeInfo.DefaultNodeInfo.Network
+		log.Info().Str("chain_id", ChainID).Msg("Got chain ID from gRPC node info")
+		return
+	}
+
+	log.Warn().Err(err).Msg("Could not determine chain ID from RPC or gRPC, using \"unknown\"")
+	ChainID = "unknown"
+}
+
+func chainIDFromTendermintRPC() string {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
 
-	// Формируем URL для запроса статуса через Tendermint RPC
-	url := fmt.Sprintf("%s/status", TendermintRPC)
-
-	// Выполняем HTTP запрос
-	resp, err := client.Get(url)
+	resp, err := client.Get(fmt.Sprintf("%s/status", TendermintRPC))
 	if err != nil {
-		log.Warn().Err(err).Msg("Could not query node status, using default chain ID")
-		ChainID = "union"
-		return
+		log.Warn().Err(err).Msg("Could not query node status via Tendermint RPC")
+		return ""
 	}
 	defer resp.Body.Close()
 
-	// Читаем тело ответа
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Warn().Err(err).Msg("Could not read response body, using default chain ID")
-		ChainID = "union"
-		return
+		log.Warn().Err(err).Msg("Could not read Tendermint RPC status response")
+		return ""
 	}
 
-	// Парсим JSON ответ
 	var result struct {
 		Result struct {
 			NodeInfo struct {
@@ -227,24 +296,11 @@ func setChainID() {
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		log.Warn().Err(err).Msg("Could not parse response JSON, using default chain ID")
-		ChainID = "union"
-		return
+		log.Warn().Err(err).Msg("Could not parse Tendermint RPC status response")
+		return ""
 	}
 
-	// Получаем chain_id из поля network
-	if result.Result.NodeInfo.Network != "" {
-		ChainID = result.Result.NodeInfo.Network
-		log.Info().Str("chain_id", ChainID).Msg("Got chain ID from node_info.network")
-	} else {
-		log.Warn().Msg("Chain ID not found in node_info.network, using default")
-		ChainID = "union"
-	}
-
-	// Обновляем ConstLabels с новым chain_id
-	ConstLabels = prometheus.Labels{
-		"chain_id": ChainID,
-	}
+	return result.Result.NodeInfo.Network
 }
 
 func setDenom(grpcConn *grpc.ClientConn) {
@@ -252,17 +308,20 @@ func setDenom(grpcConn *grpc.ClientConn) {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
+	defer cancel()
+
 	bankClient := banktypes.NewQueryClient(grpcConn)
 	denoms, err := bankClient.DenomsMetadata(
-		context.Background(),
+		ctx,
 		&banktypes.QueryDenomsMetadataRequest{},
 	)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error querying denom")
-	}
-
-	if len(denoms.Metadatas) == 0 {
-		log.Fatal().Msg("No denom infos. Try running the binary with --denom and --denom-coefficient to set them manually.")
+	if err != nil || len(denoms.Metadatas) == 0 {
+		// Кастомные сети (Sei) часто не публикуют DenomsMetadata через bank —
+		// пробуем bond denom из staking params, прежде чем сдаваться.
+		log.Warn().Err(err).Msg("No denom metadata on chain, falling back to staking bond denom")
+		setDenomFromStakingParams(grpcConn)
+		return
 	}
 
 	metadata := denoms.Metadatas[0]
@@ -286,6 +345,23 @@ func setDenom(grpcConn *grpc.ClientConn) {
 	}
 
 	log.Fatal().Msg("Could not find the denom info")
+}
+
+func setDenomFromStakingParams(grpcConn *grpc.ClientConn) {
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
+	defer cancel()
+
+	stakingClient := stakingtypes.NewQueryClient(grpcConn)
+	paramsResp, err := stakingClient.Params(ctx, &stakingtypes.QueryParamsRequest{})
+	if err != nil || paramsResp.Params.BondDenom == "" {
+		log.Fatal().Err(err).Msg("Could not determine denom. Run the binary with --denom and --denom-exponent to set them manually.")
+	}
+
+	Denom = paramsResp.Params.BondDenom
+	DenomCoefficient = 1
+	log.Warn().
+		Str("denom", Denom).
+		Msg("Using staking bond denom with coefficient 1. Set --denom and --denom-exponent explicitly for correct value scaling.")
 }
 
 func checkAndHandleDenomInfoProvidedByUser() bool {
@@ -329,6 +405,8 @@ func main() {
 	rootCmd.PersistentFlags().Uint64Var(&Limit, "limit", 1000, "Pagination limit for gRPC requests")
 	rootCmd.PersistentFlags().StringVar(&TendermintRPC, "tendermint-rpc", "http://localhost:26657", "Tendermint RPC address")
 	rootCmd.PersistentFlags().BoolVar(&JsonOutput, "json", false, "Output logs as JSON")
+	rootCmd.PersistentFlags().DurationVar(&RefreshInterval, "refresh-interval", 30*time.Second, "How often metrics may be re-collected from the node; scrapes in between are served from cache")
+	rootCmd.PersistentFlags().DurationVar(&GRPCTimeout, "grpc-timeout", 15*time.Second, "Timeout for collecting metrics from the node")
 
 	rootCmd.PersistentFlags().StringVar(&Prefix, "bech-prefix", "persistence", "Bech32 global prefix")
 	rootCmd.PersistentFlags().StringVar(&AccountPrefix, "bech-account-prefix", "", "Bech32 account prefix")
