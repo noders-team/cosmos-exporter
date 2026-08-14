@@ -79,9 +79,7 @@ func collectWalletMetrics(ctx context.Context, grpcConn *grpc.ClientConn, addres
 	var wg sync.WaitGroup
 	var successfulQueries atomic.Int64
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying balance")
@@ -113,11 +111,9 @@ func collectWalletMetrics(ctx context.Context, grpcConn *grpc.ClientConn, addres
 				"denom":   balance.Denom, // Используем реальный denom из ответа
 			}).Set(value / DenomCoefficient)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying delegations")
@@ -150,11 +146,9 @@ func collectWalletMetrics(ctx context.Context, grpcConn *grpc.ClientConn, addres
 				"delegated_to": delegation.Delegation.ValidatorAddress,
 			}).Set(value / DenomCoefficient)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying unbonding delegations")
@@ -192,11 +186,9 @@ func collectWalletMetrics(ctx context.Context, grpcConn *grpc.ClientConn, addres
 				"unbonded_from": unbonding.ValidatorAddress,
 			}).Set(sum / DenomCoefficient)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying redelegations")
@@ -235,11 +227,9 @@ func collectWalletMetrics(ctx context.Context, grpcConn *grpc.ClientConn, addres
 				"redelegated_to":   redelegation.Redelegation.ValidatorDstAddress,
 			}).Set(sum / DenomCoefficient)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying rewards")
@@ -274,7 +264,7 @@ func collectWalletMetrics(ctx context.Context, grpcConn *grpc.ClientConn, addres
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
 	wg.Wait()
 

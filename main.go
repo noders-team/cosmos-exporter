@@ -13,8 +13,10 @@ import (
 	"crypto/tls"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/cosmos/cosmos-sdk/client/grpc/cmtservice"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -280,7 +282,7 @@ func setChainID(grpcConn *grpc.ClientConn) {
 
 func chainIDFromTendermintRPC() string {
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: GRPCTimeout,
 	}
 
 	resp, err := client.Get(fmt.Sprintf("%s/status", TendermintRPC))
@@ -330,15 +332,20 @@ func setDenom(grpcConn *grpc.ClientConn) {
 	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
 	defer cancel()
 
-	bondDenom := bondDenomFromStakingParams(grpcConn)
+	bondDenom := bondDenomFromStakingParams(ctx, grpcConn)
 
 	bankClient := banktypes.NewQueryClient(grpcConn)
 	denoms, err := bankClient.DenomsMetadata(
 		ctx,
 		&banktypes.QueryDenomsMetadataRequest{},
 	)
+	if err != nil && status.Code(err) != codes.Unimplemented {
+		// Транзиентная ошибка на старте не должна молча приводить к
+		// неверному масштабу всех метрик — падаем громко, systemd перезапустит.
+		log.Fatal().Err(err).Msg("Could not query denom metadata (transient node error?). Set --denom and --denom-exponent explicitly to skip this query, or restart when the node is reachable.")
+	}
 	if err != nil {
-		log.Warn().Err(err).Msg("Could not query denom metadata")
+		log.Warn().Err(err).Msg("Denom metadata query is not implemented on this chain")
 	}
 
 	// Ищем метадату нативного денома. Брать просто первую запись нельзя:
@@ -384,10 +391,7 @@ func setDenom(grpcConn *grpc.ClientConn) {
 	log.Fatal().Msg("Could not determine denom. Run the binary with --denom and --denom-exponent to set them manually.")
 }
 
-func bondDenomFromStakingParams(grpcConn *grpc.ClientConn) string {
-	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
-	defer cancel()
-
+func bondDenomFromStakingParams(ctx context.Context, grpcConn *grpc.ClientConn) string {
 	stakingClient := stakingtypes.NewQueryClient(grpcConn)
 	paramsResp, err := stakingClient.Params(ctx, &stakingtypes.QueryParamsRequest{})
 	if err != nil {

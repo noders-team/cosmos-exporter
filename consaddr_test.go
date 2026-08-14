@@ -86,6 +86,24 @@ func TestConsAddressFromValidator(t *testing.T) {
 			prefix:  "cosmosvalcons",
 			wantErr: true,
 		},
+		{
+			name: "ed25519 with wrong key length must error, not panic",
+			pubkey: &codectypes.Any{
+				TypeUrl: ed25519PubKeyTypeURL,
+				Value:   []byte{0x0a, 0x04, 0x01, 0x02, 0x03, 0x04},
+			},
+			prefix:  "cosmosvalcons",
+			wantErr: true,
+		},
+		{
+			name: "secp256k1 with wrong key length must error, not panic",
+			pubkey: &codectypes.Any{
+				TypeUrl: secp256k1PubKeyTypeURL,
+				Value:   []byte{0x0a, 0x04, 0x01, 0x02, 0x03, 0x04},
+			},
+			prefix:  "cosmosvalcons",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

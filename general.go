@@ -88,9 +88,7 @@ func collectGeneralMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*pro
 	var wg sync.WaitGroup
 	var successfulQueries atomic.Int64
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying staking pool")
 		queryStart := time.Now()
 
@@ -116,11 +114,9 @@ func collectGeneralMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*pro
 		notBondedTokens, _ := new(big.Float).SetInt(response.Pool.NotBondedTokens.BigInt()).Float64()
 		generalBondedTokensGauge.Set(bondedTokens)
 		generalNotBondedTokensGauge.Set(notBondedTokens)
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying distribution community pool")
 		queryStart := time.Now()
 
@@ -150,11 +146,9 @@ func collectGeneralMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*pro
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying bank total supply")
 		queryStart := time.Now()
 
@@ -184,11 +178,9 @@ func collectGeneralMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*pro
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying inflation")
 		queryStart := time.Now()
 
@@ -216,11 +208,9 @@ func collectGeneralMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*pro
 		} else {
 			generalInflationGauge.Set(value)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying annual provisions")
 		queryStart := time.Now()
 
@@ -248,7 +238,7 @@ func collectGeneralMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*pro
 				"denom": Denom,
 			}).Set(value / DenomCoefficient)
 		}
-	}()
+	})
 
 	wg.Wait()
 

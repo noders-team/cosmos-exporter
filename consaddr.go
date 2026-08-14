@@ -33,11 +33,19 @@ func consAddressFromValidator(validator stakingtypes.Validator, prefix string) (
 		if err := pk.Unmarshal(anyPk.Value); err != nil {
 			return "", fmt.Errorf("failed to unmarshal ed25519 pubkey: %w", err)
 		}
+		// pk.Address() паникует на ключе неверной длины, а байты приходят
+		// из внешнего ответа ноды — валидируем сами.
+		if len(pk.Key) != ed25519.PubKeySize {
+			return "", fmt.Errorf("ed25519 pubkey has wrong size: %d bytes, want %d", len(pk.Key), ed25519.PubKeySize)
+		}
 		addrBytes = pk.Address()
 	case secp256k1PubKeyTypeURL:
 		var pk secp256k1.PubKey
 		if err := pk.Unmarshal(anyPk.Value); err != nil {
 			return "", fmt.Errorf("failed to unmarshal secp256k1 pubkey: %w", err)
+		}
+		if len(pk.Key) != secp256k1.PubKeySize {
+			return "", fmt.Errorf("secp256k1 pubkey has wrong size: %d bytes, want %d", len(pk.Key), secp256k1.PubKeySize)
 		}
 		addrBytes = pk.Address()
 	default:

@@ -5,12 +5,31 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
 )
+
+// goSafe запускает горутину сбора метрик с recover: паника (например, из
+// SDK на неожиданных данных ноды) не должна ронять весь экспортер.
+func goSafe(wg *sync.WaitGroup, fn func()) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().
+					Interface("panic", r).
+					Bytes("stack", debug.Stack()).
+					Msg("Recovered from panic in metrics collection goroutine")
+			}
+		}()
+		fn()
+	}()
+}
 
 const metricsContentType = "text/plain; version=0.0.4; charset=utf-8"
 
@@ -53,9 +72,10 @@ func (c *MetricsCache) Serve(w http.ResponseWriter, r *http.Request, key string,
 	if entry != nil {
 		select {
 		case <-entry.ready:
-			if entry.body == nil {
-				// The previous fetch failed with nothing cached — drop the
-				// entry and fetch again synchronously below.
+			// A failed fetch with nothing cached is retried synchronously,
+			// but not more often than once per TTL — otherwise every scrape
+			// against a down node would block for the full timeout.
+			if entry.body == nil && c.now().Sub(entry.fetchedAt) >= c.ttl {
 				delete(c.entries, key)
 				entry = nil
 			}
@@ -86,7 +106,7 @@ func (c *MetricsCache) Serve(w http.ResponseWriter, r *http.Request, key string,
 		return
 	}
 
-	if c.now().Sub(entry.fetchedAt) >= c.ttl && !entry.refreshing {
+	if entry.body != nil && c.now().Sub(entry.fetchedAt) >= c.ttl && !entry.refreshing {
 		entry.refreshing = true
 		go c.refresh(key, entry, fetch)
 	}
@@ -112,7 +132,17 @@ func (c *MetricsCache) refresh(key string, entry *cacheEntry, fetch fetchFunc) {
 	entry.refreshing = false
 }
 
-func (c *MetricsCache) runFetch(fetch fetchFunc) ([]byte, error) {
+func (c *MetricsCache) runFetch(fetch fetchFunc) (body []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().
+				Interface("panic", r).
+				Bytes("stack", debug.Stack()).
+				Msg("Recovered from panic during metrics collection")
+			body, err = nil, fmt.Errorf("panic during metrics collection: %v", r)
+		}
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	return fetch(ctx)

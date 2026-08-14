@@ -126,9 +126,7 @@ func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*
 
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying validators")
 		queryStart := time.Now()
 
@@ -154,11 +152,9 @@ func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*
 		sort.Slice(validators, func(i, j int) bool {
 			return validators[i].DelegatorShares.GT(validators[j].DelegatorShares)
 		})
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying validators signing infos")
 		queryStart := time.Now()
 
@@ -182,11 +178,9 @@ func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying validator signing infos")
 		signingInfos = signingInfosResponse.Info
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying staking params")
 		queryStart := time.Now()
 
@@ -206,7 +200,7 @@ func collectValidatorsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying staking params")
 		validatorSetLength = paramsResponse.Params.MaxValidators
-	}()
+	})
 
 	wg.Wait()
 

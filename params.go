@@ -165,9 +165,7 @@ func collectParamsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*prom
 	var wg sync.WaitGroup
 	var successfulQueries atomic.Int64
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying global staking params")
 		queryStart := time.Now()
 
@@ -190,11 +188,9 @@ func collectParamsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*prom
 
 		paramsMaxValidatorsGauge.Set(float64(paramsResponse.Params.MaxValidators))
 		paramsUnbondingTimeGauge.Set(paramsResponse.Params.UnbondingTime.Seconds())
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying global mint params")
 		queryStart := time.Now()
 
@@ -248,11 +244,9 @@ func collectParamsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*prom
 		} else {
 			paramsInflationRateChangeGauge.Set(value)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying global slashing params")
 		queryStart := time.Now()
 
@@ -299,11 +293,9 @@ func collectParamsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*prom
 		} else {
 			paramsSlashFractionDowntime.Set(value)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().Msg("Started querying global distribution params")
 		queryStart := time.Now()
 
@@ -347,7 +339,7 @@ func collectParamsMetrics(ctx context.Context, grpcConn *grpc.ClientConn) (*prom
 		} else {
 			paramsCommunityTaxGauge.Set(value)
 		}
-	}()
+	})
 
 	wg.Wait()
 

@@ -232,9 +232,7 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator delegations")
@@ -278,11 +276,9 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator commission")
@@ -320,11 +316,9 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator rewards")
@@ -362,11 +356,9 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				}).Set(value / DenomCoefficient)
 			}
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator unbonding delegations")
@@ -410,11 +402,9 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				"unbonded_by": unbonding.DelegatorAddress,
 			}).Set(sum / DenomCoefficient)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator redelegations")
@@ -459,11 +449,9 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				"redelegated_to": redelegation.Redelegation.ValidatorDstAddress,
 			}).Set(sum / DenomCoefficient)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator signing info")
@@ -501,11 +489,9 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 				Str("address", validator.OperatorAddress).
 				Msg("Validator is not active, not returning missed blocks amount.")
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	goSafe(&wg, func() {
 		sublogger.Debug().
 			Str("address", address).
 			Msg("Started querying validator rank and active status")
@@ -580,7 +566,7 @@ func collectValidatorMetrics(ctx context.Context, grpcConn *grpc.ClientConn, add
 			Str("address", address).
 			Float64("request-time", time.Since(queryStart).Seconds()).
 			Msg("Finished querying validator rank and active status")
-	}()
+	})
 
 	wg.Wait()
 

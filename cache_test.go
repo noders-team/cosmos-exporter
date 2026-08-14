@@ -144,9 +144,11 @@ func TestCacheFirstFetchErrorReturns500ThenRecovers(t *testing.T) {
 	clock := &fakeClock{now: time.Unix(1000, 0)}
 	cache := newTestCache(clock)
 
+	var calls atomic.Int64
 	var fail atomic.Bool
 	fail.Store(true)
 	fetch := func(ctx context.Context) ([]byte, error) {
+		calls.Add(1)
 		if fail.Load() {
 			return nil, fmt.Errorf("node unreachable")
 		}
@@ -158,10 +160,35 @@ func TestCacheFirstFetchErrorReturns500ThenRecovers(t *testing.T) {
 		t.Fatalf("error response code = %d, want 500", errResp.Code)
 	}
 
+	// Within the TTL the error is served from cache without re-hitting the node.
 	fail.Store(false)
+	cachedErr := serveKey(cache, "general", fetch)
+	if cachedErr.Code != http.StatusInternalServerError {
+		t.Fatalf("cached error response code = %d, want 500", cachedErr.Code)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("fetch called %d times during error TTL, want 1", calls.Load())
+	}
+
+	// After the TTL the fetch is retried synchronously and recovers.
+	clock.Advance(31 * time.Second)
 	okResp := serveKey(cache, "general", fetch)
 	if okResp.Code != http.StatusOK || okResp.Body.String() != "metrics ok" {
 		t.Fatalf("recovery response: code=%d body=%q", okResp.Code, okResp.Body.String())
+	}
+}
+
+func TestCachePanicInFetchBecomesError(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	cache := newTestCache(clock)
+
+	fetch := func(ctx context.Context) ([]byte, error) {
+		panic("malformed pubkey from node")
+	}
+
+	resp := serveKey(cache, "general", fetch)
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("panic response code = %d, want 500", resp.Code)
 	}
 }
 
