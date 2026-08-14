@@ -10,7 +10,10 @@ import (
 	"os"
 	"time"
 
+	"crypto/tls"
+
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/cosmos/cosmos-sdk/client/grpc/cmtservice"
@@ -50,6 +53,7 @@ var (
 
 	RefreshInterval time.Duration
 	GRPCTimeout     time.Duration
+	TLSEnabled      bool
 )
 
 var log = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
@@ -157,9 +161,14 @@ func Execute(cmd *cobra.Command, args []string) {
 	config.SetBech32PrefixForConsensusNode(ConsensusNodePrefix, ConsensusNodePubkeyPrefix)
 	config.Seal()
 
+	transportCreds := insecure.NewCredentials()
+	if TLSEnabled {
+		transportCreds = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
+	}
+
 	grpcConn, err := grpc.NewClient(
 		NodeAddress,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(transportCreds),
 	)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Could not connect to gRPC node")
@@ -287,12 +296,16 @@ func chainIDFromTendermintRPC() string {
 		return ""
 	}
 
+	// Часть публичных нод отдаёт /status как {"result": {...}}, часть — без
+	// обёртки result (например, publicnode). Поддерживаем оба формата.
+	type nodeInfo struct {
+		Network string `json:"network"`
+	}
 	var result struct {
-		Result struct {
-			NodeInfo struct {
-				Network string `json:"network"`
-			} `json:"node_info"`
+		Result *struct {
+			NodeInfo nodeInfo `json:"node_info"`
 		} `json:"result"`
+		NodeInfo *nodeInfo `json:"node_info"`
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
@@ -300,7 +313,13 @@ func chainIDFromTendermintRPC() string {
 		return ""
 	}
 
-	return result.Result.NodeInfo.Network
+	if result.Result != nil {
+		return result.Result.NodeInfo.Network
+	}
+	if result.NodeInfo != nil {
+		return result.NodeInfo.Network
+	}
+	return ""
 }
 
 func setDenom(grpcConn *grpc.ClientConn) {
@@ -311,57 +330,71 @@ func setDenom(grpcConn *grpc.ClientConn) {
 	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
 	defer cancel()
 
+	bondDenom := bondDenomFromStakingParams(grpcConn)
+
 	bankClient := banktypes.NewQueryClient(grpcConn)
 	denoms, err := bankClient.DenomsMetadata(
 		ctx,
 		&banktypes.QueryDenomsMetadataRequest{},
 	)
-	if err != nil || len(denoms.Metadatas) == 0 {
-		// Кастомные сети (Sei) часто не публикуют DenomsMetadata через bank —
-		// пробуем bond denom из staking params, прежде чем сдаваться.
-		log.Warn().Err(err).Msg("No denom metadata on chain, falling back to staking bond denom")
-		setDenomFromStakingParams(grpcConn)
-		return
+	if err != nil {
+		log.Warn().Err(err).Msg("Could not query denom metadata")
 	}
 
-	metadata := denoms.Metadatas[0]
-	if Denom == "" {
-		Denom = metadata.Display
-	}
-
-	for _, unit := range metadata.DenomUnits {
-		log.Debug().
-			Str("denom", unit.Denom).
-			Uint32("exponent", unit.Exponent).
-			Msg("Denom info")
-		if unit.Denom == Denom {
-			DenomCoefficient = math.Pow10(int(unit.Exponent))
-			log.Info().
-				Str("denom", Denom).
-				Float64("coefficient", DenomCoefficient).
-				Msg("Got denom info")
-			return
+	// Ищем метадату нативного денома. Брать просто первую запись нельзя:
+	// на Sei DenomsMetadata начинается со случайных factory-токенов.
+	if denoms != nil {
+		for _, metadata := range denoms.Metadatas {
+			if bondDenom != "" && metadata.Base != bondDenom {
+				continue
+			}
+			candidate := Denom
+			if candidate == "" {
+				candidate = metadata.Display
+			}
+			for _, unit := range metadata.DenomUnits {
+				log.Debug().
+					Str("denom", unit.Denom).
+					Uint32("exponent", unit.Exponent).
+					Msg("Denom info")
+				if unit.Denom == candidate {
+					Denom = candidate
+					DenomCoefficient = math.Pow10(int(unit.Exponent))
+					log.Info().
+						Str("denom", Denom).
+						Float64("coefficient", DenomCoefficient).
+						Msg("Got denom info")
+					return
+				}
+			}
 		}
 	}
 
-	log.Fatal().Msg("Could not find the denom info")
+	// Метадаты для нативного денома нет (Sei и другие кастомные сети) —
+	// используем bond denom как есть, в микроединицах.
+	if bondDenom != "" {
+		Denom = bondDenom
+		DenomCoefficient = 1
+		log.Warn().
+			Str("denom", Denom).
+			Msg("No denom metadata for the bond denom; using it with coefficient 1. Set --denom and --denom-exponent explicitly for correct value scaling.")
+		return
+	}
+
+	log.Fatal().Msg("Could not determine denom. Run the binary with --denom and --denom-exponent to set them manually.")
 }
 
-func setDenomFromStakingParams(grpcConn *grpc.ClientConn) {
+func bondDenomFromStakingParams(grpcConn *grpc.ClientConn) string {
 	ctx, cancel := context.WithTimeout(context.Background(), GRPCTimeout)
 	defer cancel()
 
 	stakingClient := stakingtypes.NewQueryClient(grpcConn)
 	paramsResp, err := stakingClient.Params(ctx, &stakingtypes.QueryParamsRequest{})
-	if err != nil || paramsResp.Params.BondDenom == "" {
-		log.Fatal().Err(err).Msg("Could not determine denom. Run the binary with --denom and --denom-exponent to set them manually.")
+	if err != nil {
+		log.Warn().Err(err).Msg("Could not query staking params for bond denom")
+		return ""
 	}
-
-	Denom = paramsResp.Params.BondDenom
-	DenomCoefficient = 1
-	log.Warn().
-		Str("denom", Denom).
-		Msg("Using staking bond denom with coefficient 1. Set --denom and --denom-exponent explicitly for correct value scaling.")
+	return paramsResp.Params.BondDenom
 }
 
 func checkAndHandleDenomInfoProvidedByUser() bool {
@@ -407,6 +440,7 @@ func main() {
 	rootCmd.PersistentFlags().BoolVar(&JsonOutput, "json", false, "Output logs as JSON")
 	rootCmd.PersistentFlags().DurationVar(&RefreshInterval, "refresh-interval", 30*time.Second, "How often metrics may be re-collected from the node; scrapes in between are served from cache")
 	rootCmd.PersistentFlags().DurationVar(&GRPCTimeout, "grpc-timeout", 15*time.Second, "Timeout for collecting metrics from the node")
+	rootCmd.PersistentFlags().BoolVar(&TLSEnabled, "tls", false, "Use TLS for the gRPC connection (e.g. public endpoints on port 443)")
 
 	rootCmd.PersistentFlags().StringVar(&Prefix, "bech-prefix", "persistence", "Bech32 global prefix")
 	rootCmd.PersistentFlags().StringVar(&AccountPrefix, "bech-account-prefix", "", "Bech32 account prefix")
